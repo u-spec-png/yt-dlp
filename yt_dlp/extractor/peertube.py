@@ -7,18 +7,55 @@ import re
 from .common import InfoExtractor
 from ..compat import compat_str
 from ..utils import (
+    ExtractorError,
+    float_or_none,
     int_or_none,
     parse_resolution,
     str_or_none,
     try_get,
     unified_timestamp,
     url_or_none,
+    urlencode_postdata,
     urljoin,
     OnDemandPagedList,
 )
 
 
-class PeerTubeIE(InfoExtractor):
+class PeerTubeBaseIE(InfoExtractor):
+    _API_BASE = 'https://%s/api/v1/%s/%s/%s'
+    _IS_LOGGED_IN = False
+    _HEADERS = {}
+
+    def _call_api(self, host, id, path, base, **kwargs):
+        return self._download_json(
+            self._API_BASE % (host, base, id, path), id, headers=self._HEADERS, **kwargs)
+
+    def _login(self, host):
+        username, password = self._get_login_info()
+        if username is None or self._IS_LOGGED_IN:
+            return
+        client = self._download_json(f'https://{host}/api/v1/oauth-clients/local', None, note='Downloading client info')
+        client_id = client['client_id']
+        client_secret = client['client_secret']
+
+        try:
+            login = self._download_json(f'https://{host}/api/v1/users/token', None, note='Logging in',
+                                        data=urlencode_postdata({
+                                            'client_id': client_id,
+                                            'client_secret': client_secret,
+                                            'grant_type': 'password',
+                                            'password': password,
+                                            'username': username,
+                                        }))
+        except ExtractorError as e:
+            if e.cause.code == 400:
+                raise ExtractorError('Invalid username or password', expected=True)
+            raise ExtractorError('Unable to login')
+        PeerTubeBaseIE._HEADERS['Authorization'] = f'{login["token_type"]} {login["access_token"]}'
+        PeerTubeBaseIE._IS_LOGGED_IN = True
+
+
+class PeerTubeIE(PeerTubeBaseIE):
     _INSTANCES_RE = r'''(?:
                             # Taken from https://instances.joinpeertube.org/instances
                             40two\.tube|
@@ -1050,7 +1087,6 @@ class PeerTubeIE(InfoExtractor):
                             canard\.tube
                         )'''
     _UUID_RE = r'[\da-zA-Z]{22}|[\da-fA-F]{8}-[\da-fA-F]{4}-[\da-fA-F]{4}-[\da-fA-F]{4}-[\da-fA-F]{12}'
-    _API_BASE = 'https://%s/api/v1/videos/%s/%s'
     _VALID_URL = r'''(?x)
                     (?:
                         peertube:(?P<host>[^:]+):|
@@ -1170,14 +1206,9 @@ class PeerTubeIE(InfoExtractor):
                 entries = [peertube_url]
         return entries
 
-    def _call_api(self, host, video_id, path, note=None, errnote=None, fatal=True):
-        return self._download_json(
-            self._API_BASE % (host, video_id, path), video_id,
-            note=note, errnote=errnote, fatal=fatal)
-
     def _get_subtitles(self, host, video_id):
         captions = self._call_api(
-            host, video_id, 'captions', note='Downloading captions JSON',
+            host, video_id, 'captions', 'videos', note='Downloading captions JSON',
             fatal=False)
         if not isinstance(captions, dict):
             return
@@ -1195,13 +1226,19 @@ class PeerTubeIE(InfoExtractor):
             })
         return subtitles
 
+    def _mark_watched(self, host, video_id):
+        self._download_webpage_handle(f'https://{host}/api/v1/videos/{video_id}/views',
+                                      video_id, note='Marking video as watched', data=urlencode_postdata({}))
+
     def _real_extract(self, url):
         mobj = self._match_valid_url(url)
         host = mobj.group('host') or mobj.group('host_2')
         video_id = mobj.group('id')
 
+        self._login(host)
+
         video = self._call_api(
-            host, video_id, '', note='Downloading video JSON')
+            host, video_id, '', 'videos', note='Downloading video JSON')
 
         title = video['name']
 
@@ -1218,17 +1255,36 @@ class PeerTubeIE(InfoExtractor):
             if not isinstance(file_, dict):
                 continue
             file_url = url_or_none(file_.get('fileUrl'))
+            metadata_url = file_.get('metadataUrl')
             if not file_url:
                 continue
             file_size = int_or_none(file_.get('size'))
             format_id = try_get(
-                file_, lambda x: x['resolution']['label'], compat_str)
+                file_, (lambda x: x['resolution']['id'], lambda x: x['resolution']['label']), compat_str)
             f = parse_resolution(format_id)
             f.update({
                 'url': file_url,
                 'format_id': format_id,
                 'filesize': file_size,
             })
+            if metadata_url:
+                metadata = self._download_json(metadata_url, video_id, note='Downloading format metadata')
+                if isinstance(metadata, dict):
+                    f.update({'tbr': float_or_none(try_get(metadata, lambda x: x['format']['bit_rate']), scale=1000)})
+                    for stream in metadata.get('streams') or []:
+                        if stream.get('codec_type') == 'video':
+                            f.update({
+                                'vbr': float_or_none(stream.get('bit_rate'), scale=1000),
+                                'vcodec': stream.get('codec_name'),
+                                'width': stream.get('width'),
+                                'height': stream.get('height')
+                            })
+                        else:
+                            f.update({
+                                'abr': float_or_none(stream.get('bit_rate'), scale=1000),
+                                'acodec': stream.get('codec_name'),
+                                'asr': stream.get('sample_rate'),
+                            })
             if format_id == '0p':
                 f['vcodec'] = 'none'
             else:
@@ -1240,7 +1296,7 @@ class PeerTubeIE(InfoExtractor):
         if description and len(description) >= 250:
             # description is shortened
             full_description = self._call_api(
-                host, video_id, 'description', note='Downloading description JSON',
+                host, video_id, 'description', 'videos', note='Downloading description JSON',
                 fatal=False)
 
             if isinstance(full_description, dict):
@@ -1268,6 +1324,8 @@ class PeerTubeIE(InfoExtractor):
 
         webpage_url = 'https://%s/videos/watch/%s' % (host, video_id)
 
+        self.mark_watched(host, video_id)
+
         return {
             'id': video_id,
             'title': title,
@@ -1290,12 +1348,13 @@ class PeerTubeIE(InfoExtractor):
             'tags': try_get(video, lambda x: x['tags'], list),
             'categories': categories,
             'formats': formats,
+            'release_timestamp': unified_timestamp(video.get('originallyPublishedAt')),
             'subtitles': subtitles,
             'webpage_url': webpage_url,
         }
 
 
-class PeerTubePlaylistIE(InfoExtractor):
+class PeerTubePlaylistIE(PeerTubeBaseIE):
     IE_NAME = 'PeerTube:Playlist'
     _TYPES = {
         'a': 'accounts',
@@ -1358,18 +1417,13 @@ class PeerTubePlaylistIE(InfoExtractor):
         },
         'playlist_mincount': 11,
     }]
-    _API_BASE = 'https://%s/api/v1/%s/%s%s'
     _PAGE_SIZE = 30
-
-    def call_api(self, host, name, path, base, **kwargs):
-        return self._download_json(
-            self._API_BASE % (host, base, name, path), name, **kwargs)
 
     def fetch_page(self, host, id, type, page):
         page += 1
-        video_data = self.call_api(
+        video_data = self._call_api(
             host, id,
-            f'/videos?sort=-createdAt&start={self._PAGE_SIZE * (page - 1)}&count={self._PAGE_SIZE}&nsfw=both',
+            f'videos?sort=-createdAt&start={self._PAGE_SIZE * (page - 1)}&count={self._PAGE_SIZE}&nsfw=both',
             type, note=f'Downloading page {page}').get('data', [])
         for video in video_data:
             shortUUID = video.get('shortUUID') or try_get(video, lambda x: x['video']['shortUUID'])
@@ -1379,7 +1433,7 @@ class PeerTubePlaylistIE(InfoExtractor):
                 video_id=shortUUID, video_title=video_title)
 
     def _extract_playlist(self, host, type, id):
-        info = self.call_api(host, id, '', type, note='Downloading playlist information', fatal=False)
+        info = self._call_api(host, id, '', type, note='Downloading playlist information', fatal=False)
 
         playlist_title = info.get('displayName')
         playlist_description = info.get('description')
