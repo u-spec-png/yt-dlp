@@ -212,8 +212,7 @@ class SoundcloudIE(SoundcloudBaseIE):
                     )
                     '''
     IE_NAME = 'soundcloud'
-    _TESTS = [
-        {
+    _TESTS = [{
             'url': 'http://soundcloud.com/ethmusic/lostin-powers-she-so-heavy',
             'md5': 'ebef0a451b909710ed1d7787dddbf0d7',
             'info_dict': {
@@ -398,6 +397,57 @@ class SoundcloudIE(SoundcloudBaseIE):
         'original': 0,
     }
 
+    def _get_comments(self, track):
+        comments = self._download_json(f'{self._API_V2_BASE}tracks/{track}/comments', track, note='Downloading comments json', query={
+                'threaded': 1,
+                'filter_replies': 0,
+                'limit': 200,
+                'offset': 0,
+                'linked_partitioning': 1,
+            })
+        comments_no = self._download_json(f'{self._API_V2_BASE}tracks/{track}/comments', track, note='Downloading comments json', query={
+                'threaded': 0,
+                'filter_replies': 1,
+                'limit': 200,
+                'offset': 0,
+                'linked_partitioning': 1,
+            })
+        comment_root = None
+        next_url = comments.get('next_href')
+        comments = comments['collection']
+        next_url_no = comments_no.get('next_href')
+        comments_no = comments_no['collection']
+        comments_ids = []
+        exit = True
+        while next_url_no and exit:
+            for i, comment_no in enumerate(comments_no):
+                for u, comment in enumerate(comments):
+                    if comment['id'] not in comments_ids:
+                        yield {
+                            'id': int_or_none(comment['id']),
+                            'text': comment['body'],
+                            'parent': 'root' if comment_no['id'] == comment['id'] else comment_root
+                        }
+                        comments_ids.append(comment['id'])
+                    if u == len(comments) - 1 and next_url:
+                        com = self._download_json(next_url, track, note='Downloading comments json')
+                        next_url = com.get('next_href')
+                        if com['collection'] == comments:
+                            exit = False
+                            break
+                        comments = com['collection']
+                    if comment_no['id'] == comment['id']:
+                        comment_root = comment_no['id']
+                        break
+                if not exit:
+                    break
+            if next_url_no:
+                comments_no = self._download_json(next_url_no, track, note='Downloading comments json')
+                next_url_no = comments_no.get('next_href')
+                comments_no = comments_no['collection']
+            else:
+                break
+
     def _extract_info_dict(self, info, full_title=None, secret_token=None):
         track_id = compat_str(info['id'])
         title = info['title']
@@ -547,7 +597,8 @@ class SoundcloudIE(SoundcloudBaseIE):
             'comment_count': extract_count('comment'),
             'repost_count': extract_count('reposts'),
             'genre': info.get('genre'),
-            'formats': formats
+            'formats': formats,
+            '__post_extractor': self.extract_comments(track_id),
         }
 
     def _real_extract(self, url):
