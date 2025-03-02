@@ -12,7 +12,6 @@ from ..utils import (
     int_or_none,
     parse_count,
     parse_duration,
-    qualities,
     unified_timestamp,
     url_or_none,
     urlencode_postdata,
