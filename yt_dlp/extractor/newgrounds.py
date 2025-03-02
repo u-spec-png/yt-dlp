@@ -12,6 +12,7 @@ from ..utils import (
     int_or_none,
     parse_count,
     parse_duration,
+    qualities,
     unified_timestamp,
     url_or_none,
     urlencode_postdata,
@@ -141,6 +142,13 @@ class NewgroundsIE(InfoExtractor):
         if errors := traverse_obj(result, ('errors', ..., {str})):
             raise ExtractorError(', '.join(errors) or 'Unknown Error', expected=True)
 
+    @staticmethod
+    def _get_source_url(url):
+        surl = re.sub(r'\?.+', '', url)
+        surl = re.sub(r'\.\d+p', '', surl)
+        return surl if surl!=url else None
+
+
     def _real_extract(self, url):
         media_id = self._match_id(url)
         try:
@@ -170,12 +178,20 @@ class NewgroundsIE(InfoExtractor):
             formats = []
             uploader = traverse_obj(json_video, ('author', {str}))
             for format_id, sources in traverse_obj(json_video, ('sources', {dict.items}, ...)):
-                quality = int_or_none(format_id[:-1])
+                quality =  int_or_none(format_id[:-1])
                 formats.extend({
                     'format_id': format_id,
                     'quality': quality,
                     'url': url,
                 } for url in traverse_obj(sources, (..., 'src', {url_or_none})))
+
+        source_url = self._get_source_url(formats[0]['url'])
+        if source_url:
+            formats.append({
+                'format_id': 'source',
+                'quality': 1081,
+                'url': source_url,
+            })
 
         if not uploader:
             uploader = self._html_search_regex(
